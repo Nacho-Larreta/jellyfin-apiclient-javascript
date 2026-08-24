@@ -4,8 +4,7 @@ import appStorage from './appStorage';
 function initialize(appStorage, key) {
     const json = appStorage.getItem(key) || '{}';
 
-    console.log(`Stored JSON credentials: ${json}`);
-    let credentials = JSON.parse(json);
+    const credentials = JSON.parse(json);
     credentials.Servers = credentials.Servers || [];
     return credentials;
 }

@@ -148,7 +148,6 @@ class ApiClient {
         console.debug(`ApiClient appName: ${appName}`);
         console.debug(`ApiClient appVersion: ${appVersion}`);
         console.debug(`ApiClient deviceName: ${deviceName}`);
-        console.debug(`ApiClient deviceId: ${deviceId}`);
 
         this._serverInfo = {};
         this._serverAddress = serverAddress;
@@ -623,10 +622,12 @@ class ApiClient {
         url = replaceAll(url, 'https:', 'wss:');
         url = replaceAll(url, 'http:', 'ws:');
 
-        url += `?api_key=${accessToken}`;
-        url += `&deviceId=${this.deviceId()}`;
+        url += `?${paramsToString({
+            ApiKey: accessToken,
+            deviceId: this.deviceId()
+        })}`;
 
-        console.log(`opening web socket with url: ${url}`);
+        console.log('Opening web socket.');
 
         const webSocket = new WebSocket(url);
 
@@ -4071,7 +4072,7 @@ function scheduleKeepAlive(apiClient, timeout) {
  * @since 10.6.0
  */
 function clearKeepAlive(apiClient) {
-    console.debug('Clearing KeepAlive for', apiClient._webSocket);
+    console.debug('Clearing WebSocket KeepAlive.');
     if (apiClient.keepAliveInterval) {
         clearInterval(apiClient.keepAliveInterval);
         apiClient.keepAliveInterval = null;
