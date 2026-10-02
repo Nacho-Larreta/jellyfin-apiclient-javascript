@@ -49,5 +49,23 @@ export default {
         callbacks.forEach((c) => {
             c.apply(obj, eventArgs);
         });
+    },
+
+    triggerGuarded(obj, eventName, additionalArgs, isCurrent) {
+        const eventArgs = [{ type: eventName }, ...(additionalArgs || [])];
+        const callbacks = getCallbacks(obj, eventName).slice(0);
+
+        for (const callback of callbacks) {
+            let allowed;
+            try {
+                allowed = isCurrent() === true;
+            } catch (_) {
+                return;
+            }
+            if (!allowed) {
+                return;
+            }
+            callback.apply(obj, eventArgs);
+        }
     }
 };

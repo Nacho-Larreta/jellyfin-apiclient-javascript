@@ -1,6 +1,15 @@
 ﻿import events from './events';
 import appStorage from './appStorage';
 import PromiseDelay from './promiseDelay';
+import {
+    belongsToClient,
+    captureSocketBinding,
+    captureSocketGuard,
+    createMessageDelivery,
+    guardIsCurrent,
+    matchesSocketBinding,
+    rememberMessageId
+} from './webSocketDelivery';
 
 /** Report rate limits in ms for different events */
 const reportRateLimits = {
@@ -156,6 +165,10 @@ class ApiClient {
         this._appName = appName;
         this._appVersion = appVersion;
         this._loggedIn = false;
+        this._webSocketRecord = null;
+        this._webSocketGeneration = 0;
+        this._messageDeliveryRevision = 0;
+        this._messageIdsReceived = new Map();
     }
 
     appName() {
@@ -216,6 +229,10 @@ class ApiClient {
             }
 
             const changed = val !== this._serverAddress;
+
+            if (changed) {
+                invalidateSocketSession(this);
+            }
 
             this._serverAddress = val;
 
@@ -377,6 +394,11 @@ class ApiClient {
     }
 
     setAuthenticationInfo(accessKey, userId) {
+        if (this._serverInfo.AccessToken !== accessKey || this._serverInfo.UserId !== userId ||
+            this._loggedIn !== (!!userId && !!accessKey)) {
+            invalidateSocketSession(this);
+        }
+
         this._currentUser = null;
 
         this._loggedIn = !!userId && !!accessKey;
@@ -388,6 +410,10 @@ class ApiClient {
 
     serverInfo(info) {
         if (info) {
+            if (this._serverInfo.Id !== info.Id || this._serverInfo.UserId !== info.UserId ||
+                this._serverInfo.AccessToken !== info.AccessToken) {
+                invalidateSocketSession(this);
+            }
             this._serverInfo = info;
         }
 
@@ -604,61 +630,108 @@ class ApiClient {
 
         try {
             this.openWebSocket();
-        } catch (err) {
-            console.log(`Error opening web socket: ${err}`);
+        } catch (_) {
+            console.log('Error opening web socket.');
         }
     }
 
+    setWebSocketSessionProvider(captureSession) {
+        if (captureSession != null && typeof captureSession !== 'function') {
+            throw new TypeError('WebSocket session provider must be a function or null.');
+        }
+
+        invalidateSocketSession(this);
+        this._webSocketSessionProvider = captureSession || null;
+    }
+
+    captureMessageDelivery() {
+        const record = this._webSocketRecord;
+        if (record) {
+            return admitSocketRecord(this, record) ? record.delivery : null;
+        }
+
+        const revision = this._messageDeliveryRevision;
+        const binding = captureSocketBinding(this);
+        const guard = captureSocketGuard(this._webSocketSessionProvider);
+        if (!guard || !grantMatches(this, revision, binding, guard)) {
+            return null;
+        }
+
+        return createMessageDelivery(this, () => grantMatches(this, revision, binding, guard));
+    }
+
     openWebSocket() {
+        invalidateSocketRecord(this, this._webSocketRecord);
         const accessToken = this.accessToken();
 
         if (!accessToken) {
             throw new Error('Cannot open web socket without access token.');
         }
 
-        let url = this.getUrl('socket');
+        const revision = this._messageDeliveryRevision;
+        const binding = captureSocketBinding(this);
+        const guard = captureSocketGuard(this._webSocketSessionProvider);
+        if (!guard || !grantMatches(this, revision, binding, guard)) {
+            return;
+        }
 
-        url = replaceAll(url, 'emby/socket', 'embywebsocket');
-        url = replaceAll(url, 'https:', 'wss:');
-        url = replaceAll(url, 'http:', 'ws:');
+        const record = {
+            active: true,
+            generation: ++this._webSocketGeneration,
+            binding,
+            guard,
+            revision,
+            socket: null,
+            keepAliveInterval: null,
+            deferredClose: null
+        };
+        record.delivery = createMessageDelivery(this, () => admitSocketRecord(this, record));
+        this._webSocketRecord = record;
 
-        url += `?${paramsToString({
-            ApiKey: accessToken,
-            deviceId: this.deviceId()
-        })}`;
+        let webSocket;
+        try {
+            let url = this.getUrl('socket');
+            url = replaceAll(url, 'emby/socket', 'embywebsocket');
+            url = replaceAll(url, 'https:', 'wss:');
+            url = replaceAll(url, 'http:', 'ws:');
+            url += `?${paramsToString({
+                ApiKey: accessToken,
+                deviceId: this.deviceId()
+            })}`;
 
-        console.log('Opening web socket.');
+            console.log('Opening web socket.');
+            webSocket = new WebSocket(url);
+        } catch (error) {
+            invalidateSocketRecord(this, record);
+            throw error;
+        }
 
-        const webSocket = new WebSocket(url);
+        if (!admitSocketRecord(this, record)) {
+            closeNativeSocket(webSocket);
+            return;
+        }
 
-        webSocket.onmessage = onWebSocketMessage.bind(this);
-        webSocket.onopen = onWebSocketOpen.bind(this);
-        webSocket.onerror = onWebSocketError.bind(this);
-        setSocketOnClose(this, webSocket);
-
+        record.socket = webSocket;
         this._webSocket = webSocket;
+        webSocket.onmessage = (message) => onWebSocketMessage(this, record, message);
+        webSocket.onopen = () => onWebSocketOpen(this, record);
+        webSocket.onerror = () => onWebSocketError(this, record);
+        webSocket.onclose = () => onWebSocketClose(this, record);
     }
 
     closeWebSocket() {
-        const socket = this._webSocket;
-
-        if (socket && socket.readyState === WebSocket.OPEN) {
-            socket.close();
+        const record = this._webSocketRecord;
+        invalidateSocketRecord(this, record);
+        if (record) {
+            scheduleClosedNotification(this, record);
         }
     }
 
     sendWebSocketMessage(name, data) {
-        console.log(`Sending web socket message: ${name}`);
-
-        let msg = { MessageType: name };
-
-        if (data) {
-            msg.Data = data;
+        const record = this._webSocketRecord;
+        if (record && admitSocketRecord(this, record) && record.socket.readyState === WebSocket.OPEN) {
+            sendSocketMessage(record.socket, name, data);
         }
-
-        msg = JSON.stringify(msg);
-
-        this._webSocket.send(msg);
     }
 
     sendMessage(name, data) {
@@ -672,7 +745,8 @@ class ApiClient {
     }
 
     isWebSocketOpen() {
-        const socket = this._webSocket;
+        const record = this._webSocketRecord;
+        const socket = record && admitSocketRecord(this, record) && record.socket;
 
         if (socket) {
             return socket.readyState === WebSocket.OPEN;
@@ -681,7 +755,8 @@ class ApiClient {
     }
 
     isWebSocketOpenOrConnecting() {
-        const socket = this._webSocket;
+        const record = this._webSocketRecord;
+        const socket = record && admitSocketRecord(this, record) && record.socket;
 
         if (socket) {
             return socket.readyState === WebSocket.OPEN || socket.readyState === WebSocket.CONNECTING;
@@ -3901,8 +3976,11 @@ class ApiClient {
         return false;
     }
 
-    handleMessageReceived(msg) {
-        onMessageReceivedInternal(this, msg);
+    handleMessageReceived(msg, context) {
+        const delivery = context === undefined ? this.captureMessageDelivery() : context;
+        if (belongsToClient(delivery, this) && delivery.isCurrent()) {
+            onMessageReceivedInternal(this, msg, delivery);
+        }
     }
 }
 
@@ -4014,97 +4092,206 @@ function getCachedUser(instance, userId) {
     return null;
 }
 
-function onWebSocketMessage(msg) {
-    const instance = this;
-    msg = JSON.parse(msg.data);
-    onMessageReceivedInternal(instance, msg);
+function grantMatches(client, revision, binding, guard) {
+    return client._messageDeliveryRevision === revision &&
+        matchesSocketBinding(client, binding) &&
+        guardIsCurrent(guard) &&
+        client._messageDeliveryRevision === revision &&
+        matchesSocketBinding(client, binding);
 }
 
-const messageIdsReceived = {};
+function admitSocketRecord(client, record) {
+    if (record.active && client._webSocketRecord === record &&
+        client._webSocketGeneration === record.generation &&
+        grantMatches(client, record.revision, record.binding, record.guard)) {
+        return true;
+    }
 
-function onMessageReceivedInternal(instance, msg) {
-    const messageId = msg.MessageId;
-    if (messageId) {
-        // message was already received via another protocol
-        if (messageIdsReceived[messageId]) {
+    if (record.active && client._webSocketRecord === record) {
+        invalidateSocketSession(client);
+    }
+    return false;
+}
+
+function closeNativeSocket(socket) {
+    if (socket && socket.readyState !== WebSocket.CLOSED) {
+        try {
+            socket.close();
+        } catch (_) {
+            console.debug('Web socket close failed.');
+        }
+    }
+}
+
+function invalidateSocketRecord(client, record, close = true) {
+    if (!record || !record.active) {
+        return;
+    }
+
+    record.active = false;
+    clearKeepAlive(record);
+    if (record.deferredClose) {
+        clearTimeout(record.deferredClose);
+        record.deferredClose = null;
+    }
+    if (client._webSocketRecord === record) {
+        client._webSocketRecord = null;
+        client._webSocket = null;
+    }
+
+    if (close) {
+        closeNativeSocket(record.socket);
+    }
+}
+
+function invalidateSocketSession(client) {
+    invalidateSocketRecord(client, client._webSocketRecord);
+    client._messageDeliveryRevision++;
+    client._messageIdsReceived.clear();
+}
+
+function sendSocketMessage(socket, name, data) {
+    console.log(`Sending web socket message: ${name}`);
+    const message = { MessageType: name };
+    if (data) {
+        message.Data = data;
+    }
+    socket.send(JSON.stringify(message));
+}
+
+function onWebSocketMessage(client, record, event) {
+    if (!admitSocketRecord(client, record)) {
+        return;
+    }
+
+    let message;
+    try {
+        message = JSON.parse(event.data);
+    } catch (_) {
+        return;
+    }
+
+    if (admitSocketRecord(client, record)) {
+        onMessageReceivedInternal(client, message, record.delivery);
+    }
+}
+
+function onMessageReceivedInternal(client, message, delivery) {
+    if (!delivery.isCurrent() || !message || typeof message !== 'object') {
+        return;
+    }
+
+    let messageType;
+    let messageId;
+    let data;
+    try {
+        messageType = message.MessageType;
+        messageId = message.MessageId;
+        data = message.Data;
+    } catch (_) {
+        return;
+    }
+
+    if (!delivery.isCurrent() || typeof messageType !== 'string') {
+        return;
+    }
+
+    if (messageId && !rememberMessageId(client._messageIdsReceived, messageId)) {
+        return;
+    }
+
+    if (!delivery.isCurrent()) {
+        return;
+    }
+
+    if (messageType === 'UserDeleted') {
+        client._currentUser = null;
+    } else if (messageType === 'UserUpdated' || messageType === 'UserConfigurationUpdated') {
+        let updatedUserId;
+        try {
+            updatedUserId = data && data.Id;
+        } catch (_) {
             return;
         }
-
-        messageIdsReceived[messageId] = true;
-    }
-
-    if (msg.MessageType === 'UserDeleted') {
-        instance._currentUser = null;
-    } else if (msg.MessageType === 'UserUpdated' || msg.MessageType === 'UserConfigurationUpdated') {
-        const user = msg.Data;
-        if (user.Id === instance.getCurrentUserId()) {
-            instance._currentUser = null;
+        if (delivery.isCurrent() && updatedUserId === client.getCurrentUserId()) {
+            client._currentUser = null;
         }
-    } else if (msg.MessageType === 'KeepAlive') {
+    } else if (messageType === 'KeepAlive') {
         console.debug('Received KeepAlive from server.');
-    } else if (msg.MessageType === 'ForceKeepAlive') {
-        console.debug(`Received ForceKeepAlive from server. Timeout is ${msg.Data} seconds.`);
-        instance.sendWebSocketMessage('KeepAlive');
-        scheduleKeepAlive(instance, msg.Data);
+    } else if (messageType === 'ForceKeepAlive') {
+        onForceKeepAlive(client, data, delivery);
     }
 
-    events.trigger(instance, 'message', [msg]);
-}
-
-/**
- * Starts a poller that sends KeepAlive messages using a WebSocket connection.
- * @param {Object} apiClient The ApiClient instance.
- * @param {number} timeout The number of seconds after which the WebSocket is considered lost by the server.
- * @returns {number} The id of the interval.
- * @since 10.6.0
- */
-function scheduleKeepAlive(apiClient, timeout) {
-    clearKeepAlive(apiClient);
-    apiClient.keepAliveInterval = setInterval(() => {
-        apiClient.sendWebSocketMessage('KeepAlive');
-    }, timeout * 1000 * 0.5);
-    return apiClient.keepAliveInterval;
-}
-
-/**
- * Stops the poller that is sending KeepAlive messages on a WebSocket connection.
- * @param {Object} apiClient The ApiClient instance.
- * @since 10.6.0
- */
-function clearKeepAlive(apiClient) {
-    console.debug('Clearing WebSocket KeepAlive.');
-    if (apiClient.keepAliveInterval) {
-        clearInterval(apiClient.keepAliveInterval);
-        apiClient.keepAliveInterval = null;
+    if (delivery.isCurrent()) {
+        events.triggerGuarded(client, 'message', [message, delivery], () => delivery.isCurrent());
     }
 }
 
-function onWebSocketOpen() {
-    const instance = this;
-    console.log('web socket connection opened');
-    events.trigger(instance, 'websocketopen');
+function onForceKeepAlive(client, timeout, delivery) {
+    const record = client._webSocketRecord;
+    if (!record || !admitSocketRecord(client, record) || !delivery.isCurrent() ||
+        record.socket.readyState !== WebSocket.OPEN) {
+        return;
+    }
+
+    sendSocketMessage(record.socket, 'KeepAlive');
+    if (admitSocketRecord(client, record) && delivery.isCurrent()) {
+        scheduleKeepAlive(client, record, timeout);
+    }
 }
 
-function onWebSocketError() {
-    const instance = this;
-    clearKeepAlive(instance);
-    events.trigger(instance, 'websocketerror');
-}
+function scheduleKeepAlive(client, record, timeout) {
+    clearKeepAlive(record);
+    if (typeof timeout !== 'number' || !Number.isFinite(timeout) || timeout <= 0 || timeout > 86400) {
+        return;
+    }
 
-function setSocketOnClose(apiClient, socket) {
-    socket.onclose = () => {
-        console.log('web socket closed');
-
-        clearKeepAlive(apiClient);
-        if (apiClient._webSocket === socket) {
-            console.log('nulling out web socket');
-            apiClient._webSocket = null;
+    const intervalMs = Math.max(1000, timeout * 500);
+    record.keepAliveInterval = setInterval(() => {
+        if (admitSocketRecord(client, record) && record.socket.readyState === WebSocket.OPEN) {
+            sendSocketMessage(record.socket, 'KeepAlive');
         }
+    }, intervalMs);
+}
 
-        setTimeout(() => {
-            events.trigger(apiClient, 'websocketclose');
-        }, 0);
-    };
+function clearKeepAlive(record) {
+    if (record.keepAliveInterval) {
+        clearInterval(record.keepAliveInterval);
+        record.keepAliveInterval = null;
+    }
+}
+
+function onWebSocketOpen(client, record) {
+    if (admitSocketRecord(client, record)) {
+        console.log('web socket connection opened');
+        events.triggerGuarded(client, 'websocketopen', [], () => admitSocketRecord(client, record));
+    }
+}
+
+function onWebSocketError(client, record) {
+    if (admitSocketRecord(client, record)) {
+        clearKeepAlive(record);
+        events.triggerGuarded(client, 'websocketerror', [], () => admitSocketRecord(client, record));
+    }
+}
+
+function onWebSocketClose(client, record) {
+    if (!admitSocketRecord(client, record)) {
+        return;
+    }
+
+    console.log('web socket closed');
+    invalidateSocketRecord(client, record, false);
+    scheduleClosedNotification(client, record);
+}
+
+function scheduleClosedNotification(client, record) {
+    record.deferredClose = setTimeout(() => {
+        record.deferredClose = null;
+        events.triggerGuarded(client, 'websocketclose', [], () =>
+            client._webSocketGeneration === record.generation &&
+            grantMatches(client, record.revision, record.binding, record.guard));
+    }, 0);
 }
 
 function normalizeReturnBitrate(instance, bitrate) {
